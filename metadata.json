@@ -1,0 +1,7 @@
+{
+  "name": "Eduvane AI V1.1",
+  "description": "A trust-based learning intelligence system turning student work into actionable insight.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
