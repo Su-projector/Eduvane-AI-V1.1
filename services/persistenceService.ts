@@ -73,11 +73,70 @@ export const getSubmissionById = (id: string): Submission | null => {
     return map[id] || null;
 };
 
-// Backwards compatibility wrapper if needed elsewhere, 
-// basically extracting the result part of the submission
 export const getResultById = (id: string) => {
     const sub = getSubmissionById(id);
     return sub?.result || null;
+};
+
+/**
+ * Retrieves a semantic summary of recent insights for a specific subject.
+ * Used for longitudinal pattern recognition in v1.1.
+ */
+export const getRecentInsights = (subject: string): string => {
+  try {
+    const map = getSubmissionsMap();
+    const history = getHistory();
+    
+    // Filter for same subject, take last 5 to form a context window
+    const relevantIds = history
+      .filter(h => h.subject && h.subject.toLowerCase() === subject.toLowerCase())
+      .slice(0, 5)
+      .map(h => h.id);
+
+    if (relevantIds.length === 0) return "";
+
+    const contextLines: string[] = [];
+    
+    relevantIds.forEach(id => {
+      const sub = map[id];
+      if (sub?.result) {
+        // Extract Gaps (Learning Needs)
+        const gaps = sub.result.feedback
+          .filter(f => f.type === 'gap')
+          .map(f => f.text)
+          .join('; ');
+
+        // Extract Strengths (For Feedback Compression)
+        const strengths = sub.result.feedback
+          .filter(f => f.type === 'strength')
+          .map(f => f.text)
+          .join('; ');
+
+        // Extract Insights (Previous Patterns)
+        const insights = sub.result.insights
+           .map(i => i.title)
+           .join('; ');
+        
+        // Extract Stability Signals (v1.1)
+        const stability = sub.result.conceptStability;
+        const stabilityStr = stability && stability.status !== 'unknown' 
+            ? `Stability: ${stability.status} (${stability.evidence})` 
+            : '';
+
+        // Extract Handwriting Signals (v1.1 Handwriting Impact Memory)
+        const handwriting = sub.result.handwriting?.feedback || '';
+        
+        if (gaps || strengths || insights || stabilityStr || handwriting) {
+           const dateStr = new Date(sub.timestamp).toLocaleDateString();
+           contextLines.push(`[${dateStr}] Topic: ${sub.result.topic}. Gaps: ${gaps}. Strengths: ${strengths}. Handwriting: ${handwriting}. Previous Signals: ${insights}. ${stabilityStr}`);
+        }
+      }
+    });
+
+    return contextLines.join('\n');
+  } catch (e) {
+    return "";
+  }
 };
 
 export const saveUserProfile = (profile: UserProfile) => {

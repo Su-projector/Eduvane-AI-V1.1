@@ -5,7 +5,7 @@ import {
   SYSTEM_INSTRUCTION_REASONING, 
   SYSTEM_INSTRUCTION_QUESTION_WORKSPACE
 } from "../constants";
-import { AnalysisResult, OwnershipContext } from "../types";
+import { AnalysisResult, OwnershipContext, UserRole } from "../types";
 
 const cleanJsonString = (str: string) => {
   return str.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -142,7 +142,9 @@ export class GeminiService {
     extractedText: string, 
     context: InterpretationResult,
     userInstruction: string | undefined,
-    mode: 'fast' | 'deep' // Performance mode routing
+    mode: 'fast' | 'deep', // Performance mode routing
+    historyContext?: string, // Longitudinal Intelligence
+    userRole?: UserRole // Role context for Teacher Insight Moments
   ): Promise<AnalysisResult> {
     try {
       // Fast Path: Use Flash for < 5s response on simple inputs
@@ -159,6 +161,12 @@ export class GeminiService {
         Type: ${context.ownership.type}
         Student Name: ${context.ownership.student?.name || "Unknown"}
         Student Class: ${context.ownership.student?.class || "Unknown"}
+
+        ACTIVE USER ROLE:
+        ${userRole || 'Unknown'}
+
+        HISTORY CONTEXT (PREVIOUS ANALYSIS):
+        ${historyContext || "No previous history available."}
         
         USER INSTRUCTION (Overrides Intent):
         ${userInstruction || "Standard Diagnosis"}
@@ -230,6 +238,17 @@ export class GeminiService {
                     rationale: { type: Type.STRING }
                   }
                 }
+              },
+              concept_stability: {
+                type: Type.OBJECT,
+                properties: {
+                    status: { type: Type.STRING, enum: ["emerging", "unstable_pressure", "stabilizing", "robust", "unknown"] },
+                    evidence: { type: Type.STRING }
+                }
+              },
+              teacher_insight: { 
+                type: Type.STRING, 
+                description: "Optional, brief instructional cue for teachers." 
               }
             }
           }
@@ -249,6 +268,8 @@ export class GeminiService {
         insights: Array.isArray(data.insights) ? data.insights : [],
         guidance: Array.isArray(data.guidance) ? data.guidance : [],
         handwriting: data.handwriting,
+        conceptStability: data.concept_stability, // Map internal stability signal
+        teacherInsight: data.teacher_insight, // Map Teacher Insight Moment
         ownership: context.ownership, // Pass ownership data through
         rawText: extractedText
       };
@@ -265,13 +286,16 @@ export class GeminiService {
 
   // --- Capability 2: Learning Task Execution (Stateful) ---
 
-  async streamLearningTask(message: string): Promise<any> {
+  async streamLearningTask(message: string, userRole?: UserRole): Promise<any> {
     const session = this.getOrCreateSession();
-    return session.sendMessageStream({ message });
+    // Inject role context so the model can apply Role-Governed Solving Logic
+    const contextMsg = `[Active User Role: ${userRole || 'Ambiguous'}] ${message}`;
+    return session.sendMessageStream({ message: contextMsg });
   }
 
   async injectAnalysisContext(result: AnalysisResult) {
     const feedback = Array.isArray(result.feedback) ? result.feedback : [];
+    const insights = Array.isArray(result.insights) ? result.insights : [];
     
     const contextPayload = `
       [SYSTEM UPDATE: LEARNING CONTEXT AVAILABLE]
@@ -285,7 +309,14 @@ export class GeminiService {
       Identified Learning Gaps:
       ${feedback.filter(f => f.type === 'gap').map(f => f.text).join(', ')}
 
-      This information is available for future task generation.
+      Stability Signal: ${result.conceptStability?.status || 'Unknown'} (${result.conceptStability?.evidence || 'No specific evidence'})
+
+      Previous Insights (Longitudinal):
+      ${insights.map(i => `- ${i.title}: ${i.trend}`).join('\n')}
+      
+      Teacher Insight (If any): ${result.teacherInsight || "None"}
+
+      This information is available for future task generation. Use it to infer intent (misconception vs slip) and sequence diagnostics.
     `;
     
     try {

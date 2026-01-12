@@ -27,6 +27,11 @@ export interface HandwritingAnalysis {
   feedback: string;
 }
 
+export interface ConceptStability {
+  status: 'emerging' | 'unstable_pressure' | 'stabilizing' | 'robust' | 'unknown';
+  evidence: string;
+}
+
 export interface StudentInfo {
   name?: string;
   class?: string;
@@ -54,7 +59,9 @@ export interface AnalysisResult {
   insights: Insight[];
   guidance: GuidanceStep[];
   handwriting?: HandwritingAnalysis; // New dimension
+  conceptStability?: ConceptStability; // Internal intelligence signal (v1.1)
   ownership?: OwnershipContext; // Role-aware context
+  teacherInsight?: string; // Teacher Insight Moment (v1.1) - Conversational cue
   rawText?: string;
 }
 

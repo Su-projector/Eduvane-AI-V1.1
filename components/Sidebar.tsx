@@ -81,7 +81,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {/* 3. Bottom Profile/Meta Area (Optional) */}
         <div className="p-4 border-t border-brand-border/30 flex-none">
            <div className="text-[10px] text-brand-muted text-center opacity-40">
-              Eduvane AI • v1.0
+              Eduvane AI • v1.1
            </div>
         </div>
       </aside>
