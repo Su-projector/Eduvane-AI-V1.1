@@ -14,7 +14,7 @@ const cleanJsonString = (str: string) => {
 interface InterpretationResult {
   subject: string;
   topic: string;
-  intent: string;
+  intent: 'solution' | 'explanation' | 'both';
   ownership: OwnershipContext;
 }
 
@@ -63,14 +63,15 @@ export class GeminiService {
 
   async perceive(base64Image: string, mimeType: string): Promise<string> {
     try {
-      // Use the fastest vision model for perception
-      const model = 'gemini-2.5-flash-image'; 
+      // Use gemini-3-flash-preview for PDFs as it handles documents well.
+      // Use existing model for images.
+      const model = mimeType === 'application/pdf' ? 'gemini-3-flash-preview' : 'gemini-2.5-flash-image'; 
       const response = await this.ai.models.generateContent({
         model,
         contents: {
           parts: [
             { inlineData: { data: base64Image, mimeType } },
-            { text: "Extract all legible text from this image. Describe the layout briefly." }
+            { text: "Extract all legible text from this content. Describe the layout briefly." }
           ]
         },
         config: {
@@ -102,7 +103,11 @@ export class GeminiService {
               subject: { type: Type.STRING },
               topic: { type: Type.STRING },
               difficulty: { type: Type.STRING },
-              intent: { type: Type.STRING },
+              intent: { 
+                  type: Type.STRING, 
+                  enum: ["solution", "explanation", "both"],
+                  description: "User expectation: 'solution' (answer/steps), 'explanation' (guidance/why), or 'both'."
+              },
               ownership: {
                 type: Type.OBJECT,
                 properties: {
@@ -130,15 +135,15 @@ export class GeminiService {
       return { 
           subject: "General", 
           topic: "Unknown", 
-          intent: "Learning",
+          intent: "explanation",
           ownership: { type: "student_direct" }
       };
     }
   }
 
   async reason(
-    base64Image: string, 
-    mimeType: string, 
+    base64Image: string | undefined, 
+    mimeType: string | undefined, 
     extractedText: string, 
     context: InterpretationResult,
     userInstruction: string | undefined,
@@ -152,39 +157,35 @@ export class GeminiService {
       const model = mode === 'fast' ? 'gemini-3-flash-preview' : 'gemini-3-pro-preview';
       
       const prompt = `
-        CONTEXT:
-        Subject: ${context.subject}
-        Topic: ${context.topic}
-        Intent: ${context.intent}
+        [LEVEL 2: USER ROLE & OWNERSHIP]
+        Active Role: ${userRole || 'Unknown'}
+        Ownership Type: ${context.ownership.type}
+        Student: ${context.ownership.student?.name || "Unknown"} (${context.ownership.student?.class || "Unknown"})
+
+        [LEVEL 3: USER REQUEST & INTENT]
+        Detected Intent: ${context.intent}
+        Explicit Instruction: ${userInstruction || "None"}
         
-        OWNERSHIP CONTEXT (STRICTLY FOLLOW PERSPECTIVE RULES):
-        Type: ${context.ownership.type}
-        Student Name: ${context.ownership.student?.name || "Unknown"}
-        Student Class: ${context.ownership.student?.class || "Unknown"}
+        [LEVEL 4: CONTEXT]
+        Subject/Topic: ${context.subject} / ${context.topic}
+        History: ${historyContext || "None"}
 
-        ACTIVE USER ROLE:
-        ${userRole || 'Unknown'}
-
-        HISTORY CONTEXT (PREVIOUS ANALYSIS):
-        ${historyContext || "No previous history available."}
-        
-        USER INSTRUCTION (Overrides Intent):
-        ${userInstruction || "Standard Diagnosis"}
-
-        EXTRACTED TEXT:
+        [CONTENT TO ANALYZE]
         ${extractedText}
         
-        Analyze the original image (provided) and the text.
+        Analyze strictly following the INSTRUCTION HIERARCHY.
         Generate a JSON response for the Eduvane AI MVP.
       `;
+
+      const parts: any[] = [{ text: prompt }];
+      if (base64Image && mimeType) {
+          parts.unshift({ inlineData: { data: base64Image, mimeType } });
+      }
 
       const response = await this.ai.models.generateContent({
         model,
         contents: {
-            parts: [
-                { inlineData: { data: base64Image, mimeType } },
-                { text: prompt }
-            ]
+            parts
         },
         config: {
           systemInstruction: SYSTEM_INSTRUCTION_REASONING,
