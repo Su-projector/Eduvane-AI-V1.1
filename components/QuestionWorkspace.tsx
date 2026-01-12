@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { geminiService } from '../services/geminiService';
-import { ChatMessage } from '../types';
-import { Chat, GenerateContentResponse } from '@google/genai';
+import { ChatMessage, IChatSession, IGenerationChunk } from '../types';
 
 interface QuestionWorkspaceProps {
   onExit: () => void;
@@ -26,7 +25,7 @@ export const QuestionWorkspace: React.FC<QuestionWorkspaceProps> = ({ onExit }) 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const chatSessionRef = useRef<Chat | null>(null);
+  const chatSessionRef = useRef<IChatSession | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -87,8 +86,8 @@ export const QuestionWorkspace: React.FC<QuestionWorkspaceProps> = ({ onExit }) 
         }]);
 
         for await (const chunk of resultStream) {
-            const c = chunk as GenerateContentResponse;
-            const textChunk = c.text;
+            // chunk is now IGenerationChunk { text: string }
+            const textChunk = chunk.text;
             if (textChunk) {
                 fullResponseText += textChunk;
                 setMessages(prev => prev.map(m => 

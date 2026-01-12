@@ -1,16 +1,12 @@
-import { GoogleGenAI, Type, Chat } from "@google/genai";
 import { 
   SYSTEM_INSTRUCTION_PERCEPTION, 
   SYSTEM_INSTRUCTION_INTERPRETATION, 
   SYSTEM_INSTRUCTION_REASONING, 
   SYSTEM_INSTRUCTION_QUESTION_WORKSPACE
 } from "../constants";
-import { AnalysisResult, OwnershipContext, UserRole } from "../types";
+import { AnalysisResult, OwnershipContext, UserRole, IChatSession, IGenerationChunk } from "../types";
 
-const cleanJsonString = (str: string) => {
-  return str.replace(/```json/g, '').replace(/```/g, '').trim();
-};
-
+// --- Types for Transport Layer ---
 interface InterpretationResult {
   subject: string;
   topic: string;
@@ -18,68 +14,132 @@ interface InterpretationResult {
   ownership: OwnershipContext;
 }
 
+const SERVER_API_BASE = '/api';
+
+/**
+ * RemoteChatSession
+ * Manages chat history client-side and delegates generation to the stateless /chat endpoint.
+ */
+class RemoteChatSession implements IChatSession {
+  private history: { role: string; parts: { text: string }[] }[] = [];
+  private systemInstruction: string;
+  private model: string; // tracked for context, though server logic might override based on endpoint config
+
+  constructor(systemInstruction: string, model: string = 'gemini-3-flash-preview') {
+    this.systemInstruction = systemInstruction;
+    this.model = model;
+  }
+
+  async sendMessageStream(request: { message: string }): Promise<AsyncGenerator<IGenerationChunk>> {
+    const userMsg = { role: 'user', parts: [{ text: request.message }] };
+    
+    // Prepare payload: History + New Message
+    const payload = {
+      model: this.model,
+      systemInstruction: this.systemInstruction,
+      history: this.history,
+      message: request.message
+    };
+
+    try {
+      const response = await fetch(`${SERVER_API_BASE}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) throw new Error('Chat request failed');
+      if (!response.body) throw new Error('No response body');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      
+      const that = this; // Capture scope for history update
+
+      // Create a generator that yields chunks and updates history on completion
+      async function* generator() {
+        let fullResponseText = '';
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            const chunk = decoder.decode(value, { stream: true });
+            // Server sends raw text chunks. 
+            // Note: In a real prod setup, we might use SSE (Server Sent Events) for structured data.
+            // For this proxy, we assume the server flushes raw text tokens.
+            if (chunk) {
+              fullResponseText += chunk;
+              yield { text: chunk };
+            }
+          }
+        } finally {
+          // Update History with the turn
+          that.history.push(userMsg);
+          that.history.push({ role: 'model', parts: [{ text: fullResponseText }] });
+        }
+      }
+
+      return generator();
+
+    } catch (e) {
+      console.error("Stream error", e);
+      throw e;
+    }
+  }
+
+  async sendMessage(request: { message: string }): Promise<{ text: string }> {
+    // Non-streaming fallback using the stream implementation
+    const generator = await this.sendMessageStream(request);
+    let fullText = '';
+    for await (const chunk of generator) {
+      fullText += chunk.text;
+    }
+    return { text: fullText };
+  }
+}
+
 export class GeminiService {
-  private ai: GoogleGenAI;
-  private currentSession: Chat | null = null;
+  private currentSession: IChatSession | null = null;
 
   constructor() {
-    const apiKey = process.env.API_KEY;
-    if (!apiKey) {
-      console.error("API Key is missing.");
-    }
-    this.ai = new GoogleGenAI({ apiKey: apiKey || '' });
+    // API Key is now handled on the server.
   }
 
   // --- Session Lifecycle Management ---
   
-  private getOrCreateSession(): Chat {
+  private getOrCreateSession(): IChatSession {
     if (!this.currentSession) {
-      this.currentSession = this.ai.chats.create({
-        model: 'gemini-3-flash-preview',
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION_QUESTION_WORKSPACE,
-          temperature: 0.7,
-        }
-      });
+      this.currentSession = new RemoteChatSession(SYSTEM_INSTRUCTION_QUESTION_WORKSPACE);
     }
     return this.currentSession;
   }
 
-  public createQuestionSession(): Chat {
-    return this.ai.chats.create({
-      model: 'gemini-3-flash-preview',
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION_QUESTION_WORKSPACE,
-        temperature: 0.7,
-      }
-    });
+  public createQuestionSession(): IChatSession {
+    return new RemoteChatSession(SYSTEM_INSTRUCTION_QUESTION_WORKSPACE);
   }
 
   public endSession() {
     this.currentSession = null;
   }
 
-  // --- Capability 1: Analysis Execution (Stateless) ---
+  // --- Capability 1: Analysis Execution (Stateless via Proxy) ---
 
   async perceive(base64Image: string, mimeType: string): Promise<string> {
     try {
-      // Use gemini-3-flash-preview for PDFs as it handles documents well.
-      // Use existing model for images.
-      const model = mimeType === 'application/pdf' ? 'gemini-3-flash-preview' : 'gemini-2.5-flash-image'; 
-      const response = await this.ai.models.generateContent({
-        model,
-        contents: {
-          parts: [
-            { inlineData: { data: base64Image, mimeType } },
-            { text: "Extract all legible text from this content. Describe the layout briefly." }
-          ]
-        },
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION_PERCEPTION,
-          temperature: 0.1, 
-        }
+      const response = await fetch(`${SERVER_API_BASE}/perceive`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image: base64Image,
+          mimeType: mimeType,
+          systemInstruction: SYSTEM_INSTRUCTION_PERCEPTION
+        })
       });
-      return response.text || "";
+      
+      if (!response.ok) throw new Error('Perception request failed');
+      const data = await response.json();
+      return data.text || "";
     } catch (e) {
       console.error("Perception failed", e);
       throw new Error("Unable to read the document.");
@@ -88,48 +148,20 @@ export class GeminiService {
 
   async interpret(extractedText: string): Promise<InterpretationResult> {
     try {
-      const model = 'gemini-3-flash-preview';
-      const response = await this.ai.models.generateContent({
-        model,
-        contents: {
-          parts: [{ text: `Analyzed Text: ${extractedText}` }]
-        },
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION_INTERPRETATION,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              subject: { type: Type.STRING },
-              topic: { type: Type.STRING },
-              difficulty: { type: Type.STRING },
-              intent: { 
-                  type: Type.STRING, 
-                  enum: ["solution", "explanation", "both"],
-                  description: "User expectation: 'solution' (answer/steps), 'explanation' (guidance/why), or 'both'."
-              },
-              ownership: {
-                type: Type.OBJECT,
-                properties: {
-                    type: { type: Type.STRING, enum: ["student_direct", "teacher_uploaded_student_work"] },
-                    student: {
-                        type: Type.OBJECT,
-                        properties: {
-                            name: { type: Type.STRING },
-                            class: { type: Type.STRING },
-                            confidence: { type: Type.STRING, enum: ["high", "medium", "low"] }
-                        }
-                    }
-                },
-                required: ["type"]
-              }
-            },
-            required: ["subject", "topic", "intent", "ownership"]
-          }
-        }
+      const response = await fetch(`${SERVER_API_BASE}/interpret`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: extractedText,
+          systemInstruction: SYSTEM_INSTRUCTION_INTERPRETATION
+        })
       });
-      const jsonText = cleanJsonString(response.text || "{}");
-      return JSON.parse(jsonText);
+
+      if (!response.ok) throw new Error('Interpretation request failed');
+      const data = await response.json();
+      
+      // The server returns the JSON object directly
+      return data; 
     } catch (e) {
       // Fallback
       return { 
@@ -147,15 +179,12 @@ export class GeminiService {
     extractedText: string, 
     context: InterpretationResult,
     userInstruction: string | undefined,
-    mode: 'fast' | 'deep', // Performance mode routing
-    historyContext?: string, // Longitudinal Intelligence
-    userRole?: UserRole // Role context for Teacher Insight Moments
+    mode: 'fast' | 'deep', 
+    historyContext?: string, 
+    userRole?: UserRole 
   ): Promise<AnalysisResult> {
     try {
-      // Fast Path: Use Flash for < 5s response on simple inputs
-      // Deep Path: Use Pro for complex reasoning
-      const model = mode === 'fast' ? 'gemini-3-flash-preview' : 'gemini-3-pro-preview';
-      
+      // Prompt construction remains on client to preserve logic/orchestration control
       const prompt = `
         [LEVEL 2: USER ROLE & OWNERSHIP]
         Active Role: ${userRole || 'Unknown'}
@@ -177,88 +206,22 @@ export class GeminiService {
         Generate a JSON response for the Eduvane AI MVP.
       `;
 
-      const parts: any[] = [{ text: prompt }];
-      if (base64Image && mimeType) {
-          parts.unshift({ inlineData: { data: base64Image, mimeType } });
-      }
-
-      const response = await this.ai.models.generateContent({
-        model,
-        contents: {
-            parts
-        },
-        config: {
+      const response = await fetch(`${SERVER_API_BASE}/reason`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          image: base64Image,
+          mimeType: mimeType,
           systemInstruction: SYSTEM_INSTRUCTION_REASONING,
-          responseMimeType: "application/json",
-           responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              score: {
-                type: Type.OBJECT,
-                properties: {
-                  value: { type: Type.STRING, description: "Numeric score or Letter grade" },
-                  label: { type: Type.STRING, description: "Short descriptive label" },
-                  reasoning: { type: Type.STRING, description: "Why this score was given" }
-                }
-              },
-              feedback: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    type: { type: Type.STRING, enum: ["strength", "gap", "neutral"] },
-                    text: { type: Type.STRING },
-                    reference: { type: Type.STRING }
-                  }
-                }
-              },
-              handwriting: {
-                type: Type.OBJECT,
-                properties: {
-                    quality: { type: Type.STRING, enum: ["excellent", "good", "fair", "poor", "illegible"] },
-                    feedback: { type: Type.STRING }
-                }
-              },
-              insights: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    description: { type: Type.STRING },
-                    trend: { type: Type.STRING, enum: ["stable", "improving", "declining", "new"] }
-                  }
-                }
-              },
-              guidance: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    step: { type: Type.STRING },
-                    rationale: { type: Type.STRING }
-                  }
-                }
-              },
-              concept_stability: {
-                type: Type.OBJECT,
-                properties: {
-                    status: { type: Type.STRING, enum: ["emerging", "unstable_pressure", "stabilizing", "robust", "unknown"] },
-                    evidence: { type: Type.STRING }
-                }
-              },
-              teacher_insight: { 
-                type: Type.STRING, 
-                description: "Optional, brief instructional cue for teachers." 
-              }
-            }
-          }
-        }
+          mode // 'fast' or 'deep' -> Server maps to appropriate key/model
+        })
       });
 
-      const jsonText = cleanJsonString(response.text || "{}");
-      const data = JSON.parse(jsonText);
-      
+      if (!response.ok) throw new Error('Reasoning request failed');
+      const data = await response.json();
+
+      // Mapping response to internal type
       const result: AnalysisResult = {
         id: crypto.randomUUID(),
         timestamp: Date.now(),
@@ -269,9 +232,9 @@ export class GeminiService {
         insights: Array.isArray(data.insights) ? data.insights : [],
         guidance: Array.isArray(data.guidance) ? data.guidance : [],
         handwriting: data.handwriting,
-        conceptStability: data.concept_stability, // Map internal stability signal
-        teacherInsight: data.teacher_insight, // Map Teacher Insight Moment
-        ownership: context.ownership, // Pass ownership data through
+        conceptStability: data.concept_stability,
+        teacherInsight: data.teacher_insight,
+        ownership: context.ownership,
         rawText: extractedText
       };
 
@@ -285,11 +248,10 @@ export class GeminiService {
     }
   }
 
-  // --- Capability 2: Learning Task Execution (Stateful) ---
+  // --- Capability 2: Learning Task Execution (Stateful via Remote Session) ---
 
   async streamLearningTask(message: string, userRole?: UserRole): Promise<any> {
     const session = this.getOrCreateSession();
-    // Inject role context so the model can apply Role-Governed Solving Logic
     const contextMsg = `[Active User Role: ${userRole || 'Ambiguous'}] ${message}`;
     return session.sendMessageStream({ message: contextMsg });
   }
@@ -322,6 +284,7 @@ export class GeminiService {
     
     try {
       const session = this.getOrCreateSession();
+      // We use the non-streaming send for context injection
       await session.sendMessage({ message: contextPayload }); 
     } catch (e) {
       console.error("Failed to inject context", e);

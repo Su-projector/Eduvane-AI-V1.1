@@ -111,3 +111,15 @@ export interface UnifiedInput {
 }
 
 export type UserRole = 'TEACHER' | 'STUDENT';
+
+// --- SERVER MODE ABSTRACTIONS ---
+// Decoupling from @google/genai SDK types for UI components
+
+export interface IGenerationChunk {
+  text: string;
+}
+
+export interface IChatSession {
+  sendMessageStream(request: { message: string }): Promise<AsyncGenerator<IGenerationChunk>>;
+  sendMessage(request: { message: string }): Promise<{ text: string }>;
+}
