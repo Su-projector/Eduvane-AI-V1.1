@@ -5,6 +5,34 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// --- STRICT ENVIRONMENT VALIDATION ---
+const REQUIRED_KEYS = [
+  'EDUVANE_PERCEPTION_API_KEY',
+  'EDUVANE_INTERPRETATION_API_KEY',
+  'EDUVANE_REASONING_API_KEY',
+  'EDUVANE_CHAT_API_KEY'
+];
+
+const validateEnvironment = () => {
+  const missingKeys = REQUIRED_KEYS.filter(key => !process.env[key] || process.env[key]?.trim() === '');
+  
+  if (missingKeys.length > 0) {
+    console.error('-------------------------------------------------------');
+    console.error('FATAL BOOT ERROR: Missing Required Environment Variables');
+    console.error('-------------------------------------------------------');
+    console.error('The following API keys must be set in your .env file or environment:');
+    missingKeys.forEach(key => console.error(` ❌ ${key}`));
+    console.error('-------------------------------------------------------');
+    console.error('Eduvane AI cannot start without these security credentials.');
+    (process as any).exit(1);
+  } else {
+    console.log('✅ Environment configuration validated.');
+  }
+};
+
+// Validate immediately on startup
+validateEnvironment();
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -12,7 +40,10 @@ app.use(express.json({ limit: '10mb' }));
 // --- API Key Segmentation & Validation ---
 
 const getClient = (layer: 'PERCEPTION' | 'INTERPRETATION' | 'REASONING' | 'CHAT') => {
-  const key = process.env[`EDUVANE_${layer}_API_KEY`];
+  const keyName = `EDUVANE_${layer}_API_KEY`;
+  const key = process.env[keyName];
+  
+  // Redundant runtime check for type safety, though boot validation covers this.
   if (!key) {
     throw new Error(`Configuration Error: Missing API Key for ${layer} layer.`);
   }
