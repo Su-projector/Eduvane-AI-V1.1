@@ -5,6 +5,12 @@ import {
   SYSTEM_INSTRUCTION_QUESTION_WORKSPACE
 } from "../constants";
 import { AnalysisResult, OwnershipContext, UserRole, IChatSession, IGenerationChunk } from "../types";
+import { GoogleGenAI, Type, GenerateContentResponse, Content } from "@google/genai";
+
+// 1. Configuration
+const API_BASE = 'http://localhost:3000/api';
+// Initialize SDK for fallback (Client-side execution)
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // --- Types for Transport Layer ---
 interface InterpretationResult {
@@ -14,162 +20,247 @@ interface InterpretationResult {
   ownership: OwnershipContext;
 }
 
-const SERVER_API_BASE = '/api';
-
 /**
- * RemoteChatSession
- * Manages chat history client-side and delegates generation to the stateless /chat endpoint.
+ * HybridChatSession
+ * Strategy:
+ * 1. Attempt to send message via Server API (State managed via history payload).
+ * 2. If Server fails, fallback to direct SDK call using the same history.
+ * 3. Maintain a "Canonical History" locally to ensure continuity across transport switches.
  */
-class RemoteChatSession implements IChatSession {
-  private history: { role: string; parts: { text: string }[] }[] = [];
-  private systemInstruction: string;
-  private model: string; // tracked for context, though server logic might override based on endpoint config
+class HybridChatSession implements IChatSession {
+  // Canonical History: Shared state for both Server and SDK modes
+  private history: Content[] = [];
 
-  constructor(systemInstruction: string, model: string = 'gemini-3-flash-preview') {
-    this.systemInstruction = systemInstruction;
-    this.model = model;
-  }
+  constructor(private systemInstruction: string) {}
 
   async sendMessageStream(request: { message: string }): Promise<AsyncGenerator<IGenerationChunk>> {
-    const userMsg = { role: 'user', parts: [{ text: request.message }] };
+    const userContent: Content = { role: 'user', parts: [{ text: request.message }] };
     
-    // Prepare payload: History + New Message
-    const payload = {
-      model: this.model,
-      systemInstruction: this.systemInstruction,
-      history: this.history,
-      message: request.message
-    };
+    // Optimistic Update
+    this.history.push(userContent);
 
     try {
-      const response = await fetch(`${SERVER_API_BASE}/chat`, {
+      // --- ATTEMPT 1: SERVER ---
+      const response = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          message: request.message,
+          history: this.history.slice(0, -1), // Send history excluding the just-added message (server adds it)
+          systemInstruction: this.systemInstruction,
+          model: 'gemini-3-flash-preview'
+        })
       });
 
-      if (!response.ok) throw new Error('Chat request failed');
-      if (!response.body) throw new Error('No response body');
+      if (!response.ok || !response.body) throw new Error("Server unreachable or error");
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      
-      const that = this; // Capture scope for history update
+      const that = this;
+      let fullResponse = "";
 
-      // Create a generator that yields chunks and updates history on completion
-      async function* generator() {
-        let fullResponseText = '';
+      async function* serverGenerator() {
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            
             const chunk = decoder.decode(value, { stream: true });
-            // Server sends raw text chunks. 
-            // Note: In a real prod setup, we might use SSE (Server Sent Events) for structured data.
-            // For this proxy, we assume the server flushes raw text tokens.
             if (chunk) {
-              fullResponseText += chunk;
+              fullResponse += chunk;
               yield { text: chunk };
             }
           }
-        } finally {
-          // Update History with the turn
-          that.history.push(userMsg);
-          that.history.push({ role: 'model', parts: [{ text: fullResponseText }] });
+          // Sync canonical history with server response
+          that.history.push({ role: 'model', parts: [{ text: fullResponse }] });
+        } catch (e) {
+          console.error("Server Stream Error", e);
+          throw e; 
         }
       }
 
-      return generator();
+      return serverGenerator();
 
-    } catch (e) {
-      console.error("Stream error", e);
-      throw e;
+    } catch (serverError) {
+      console.warn("⚠️ Server Mode Failed. Falling back to Client SDK.", serverError);
+
+      // --- ATTEMPT 2: CLIENT SDK ---
+      try {
+        // We recreate the chat session with the current canonical history
+        // Note: We exclude the last user message from 'history' param because sendMessageStream takes it as arg
+        const historyForSdk = this.history.slice(0, -1);
+        
+        const chat = ai.chats.create({
+          model: 'gemini-3-flash-preview',
+          history: historyForSdk,
+          config: {
+            systemInstruction: this.systemInstruction,
+          }
+        });
+
+        const resultStream = await chat.sendMessageStream({ message: request.message });
+        const that = this;
+        let fullResponse = "";
+
+        async function* sdkGenerator() {
+            for await (const chunk of resultStream) {
+                const c = chunk as GenerateContentResponse;
+                if (c.text) {
+                    fullResponse += c.text;
+                    yield { text: c.text };
+                }
+            }
+            // Sync canonical history with SDK response
+            that.history.push({ role: 'model', parts: [{ text: fullResponse }] });
+        }
+
+        return sdkGenerator();
+
+      } catch (sdkError) {
+        console.error("Critical: Both Server and SDK failed.", sdkError);
+        throw sdkError;
+      }
     }
   }
 
   async sendMessage(request: { message: string }): Promise<{ text: string }> {
-    // Non-streaming fallback using the stream implementation
     const generator = await this.sendMessageStream(request);
-    let fullText = '';
+    let text = "";
     for await (const chunk of generator) {
-      fullText += chunk.text;
+      text += chunk.text;
     }
-    return { text: fullText };
+    return { text };
   }
 }
 
 export class GeminiService {
   private currentSession: IChatSession | null = null;
 
-  constructor() {
-    // API Key is now handled on the server.
-  }
-
   // --- Session Lifecycle Management ---
   
   private getOrCreateSession(): IChatSession {
     if (!this.currentSession) {
-      this.currentSession = new RemoteChatSession(SYSTEM_INSTRUCTION_QUESTION_WORKSPACE);
+      this.currentSession = new HybridChatSession(SYSTEM_INSTRUCTION_QUESTION_WORKSPACE);
     }
     return this.currentSession;
   }
 
   public createQuestionSession(): IChatSession {
-    return new RemoteChatSession(SYSTEM_INSTRUCTION_QUESTION_WORKSPACE);
+    return new HybridChatSession(SYSTEM_INSTRUCTION_QUESTION_WORKSPACE);
   }
 
   public endSession() {
     this.currentSession = null;
   }
 
-  // --- Capability 1: Analysis Execution (Stateless via Proxy) ---
+  // --- Capability 1: Analysis Execution (Hybrid) ---
 
   async perceive(base64Image: string, mimeType: string): Promise<string> {
+    const payload = {
+        image: base64Image,
+        mimeType,
+        systemInstruction: SYSTEM_INSTRUCTION_PERCEPTION
+    };
+
+    // 1. Try Server
     try {
-      const response = await fetch(`${SERVER_API_BASE}/perceive`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          image: base64Image,
-          mimeType: mimeType,
-          systemInstruction: SYSTEM_INSTRUCTION_PERCEPTION
-        })
-      });
-      
-      if (!response.ok) throw new Error('Perception request failed');
-      const data = await response.json();
-      return data.text || "";
+        const response = await fetch(`${API_BASE}/perceive`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error("Server Error");
+        const data = await response.json();
+        return data.text || "";
     } catch (e) {
-      console.error("Perception failed", e);
-      throw new Error("Unable to read the document.");
+        console.warn("Falling back to SDK for Perception");
+        // 2. Fallback SDK
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: {
+                parts: [
+                    { inlineData: { data: base64Image, mimeType: mimeType } },
+                    { text: "Extract all legible text from this content. Describe the layout briefly." }
+                ]
+            },
+            config: {
+                systemInstruction: SYSTEM_INSTRUCTION_PERCEPTION,
+                temperature: 0.1,
+            }
+        });
+        return response.text || "";
     }
   }
 
   async interpret(extractedText: string): Promise<InterpretationResult> {
-    try {
-      const response = await fetch(`${SERVER_API_BASE}/interpret`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: extractedText,
-          systemInstruction: SYSTEM_INSTRUCTION_INTERPRETATION
-        })
-      });
+    const payload = {
+        text: extractedText,
+        systemInstruction: SYSTEM_INSTRUCTION_INTERPRETATION
+    };
 
-      if (!response.ok) throw new Error('Interpretation request failed');
-      const data = await response.json();
-      
-      // The server returns the JSON object directly
-      return data; 
+    // Shared Schema for SDK
+    const interpretationSchema = {
+        type: Type.OBJECT,
+        properties: {
+          subject: { type: Type.STRING },
+          topic: { type: Type.STRING },
+          difficulty: { type: Type.STRING },
+          intent: { 
+              type: Type.STRING, 
+              enum: ["solution", "explanation", "both"],
+          },
+          ownership: {
+            type: Type.OBJECT,
+            properties: {
+                type: { type: Type.STRING, enum: ["student_direct", "teacher_uploaded_student_work"] },
+                student: {
+                    type: Type.OBJECT,
+                    properties: {
+                        name: { type: Type.STRING },
+                        class: { type: Type.STRING },
+                        confidence: { type: Type.STRING, enum: ["high", "medium", "low"] }
+                    }
+                }
+            },
+            required: ["type"]
+          }
+        },
+        required: ["subject", "topic", "intent", "ownership"]
+    };
+
+    // 1. Try Server
+    try {
+        const response = await fetch(`${API_BASE}/interpret`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error("Server Error");
+        return await response.json();
     } catch (e) {
-      // Fallback
-      return { 
-          subject: "General", 
-          topic: "Unknown", 
-          intent: "explanation",
-          ownership: { type: "student_direct" }
-      };
+        console.warn("Falling back to SDK for Interpretation");
+        // 2. Fallback SDK
+        try {
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-flash-preview',
+                contents: {
+                    parts: [{ text: `Analyzed Text: ${extractedText}` }]
+                },
+                config: {
+                    systemInstruction: SYSTEM_INSTRUCTION_INTERPRETATION,
+                    responseMimeType: "application/json",
+                    responseSchema: interpretationSchema
+                }
+            });
+            const jsonStr = response.text || "{}";
+            return JSON.parse(jsonStr);
+        } catch (sdkError) {
+             return { 
+                subject: "General", 
+                topic: "Unknown", 
+                intent: "explanation",
+                ownership: { type: "student_direct" }
+            };
+        }
     }
   }
 
@@ -178,14 +269,13 @@ export class GeminiService {
     mimeType: string | undefined, 
     extractedText: string, 
     context: InterpretationResult,
-    userInstruction: string | undefined,
+    userInstruction: string | undefined, 
     mode: 'fast' | 'deep', 
     historyContext?: string, 
     userRole?: UserRole 
   ): Promise<AnalysisResult> {
-    try {
-      // Prompt construction remains on client to preserve logic/orchestration control
-      const prompt = `
+    
+    const prompt = `
         [LEVEL 2: USER ROLE & OWNERSHIP]
         Active Role: ${userRole || 'Unknown'}
         Ownership Type: ${context.ownership.type}
@@ -204,53 +294,134 @@ export class GeminiService {
         
         Analyze strictly following the INSTRUCTION HIERARCHY.
         Generate a JSON response for the Eduvane AI MVP.
-      `;
+    `;
 
-      const response = await fetch(`${SERVER_API_BASE}/reason`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          image: base64Image,
-          mimeType: mimeType,
-          systemInstruction: SYSTEM_INSTRUCTION_REASONING,
-          mode // 'fast' or 'deep' -> Server maps to appropriate key/model
-        })
-      });
+    const payload = {
+        prompt,
+        image: base64Image,
+        mimeType,
+        systemInstruction: SYSTEM_INSTRUCTION_REASONING,
+        mode
+    };
 
-      if (!response.ok) throw new Error('Reasoning request failed');
-      const data = await response.json();
+    // Shared Schema for SDK
+    const reasonSchema = {
+        type: Type.OBJECT,
+        properties: {
+          score: {
+            type: Type.OBJECT,
+            properties: {
+              value: { type: Type.STRING },
+              label: { type: Type.STRING },
+              reasoning: { type: Type.STRING }
+            }
+          },
+          feedback: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                type: { type: Type.STRING, enum: ["strength", "gap", "neutral"] },
+                text: { type: Type.STRING },
+                reference: { type: Type.STRING }
+              }
+            }
+          },
+          handwriting: {
+            type: Type.OBJECT,
+            properties: {
+                quality: { type: Type.STRING, enum: ["excellent", "good", "fair", "poor", "illegible"] },
+                feedback: { type: Type.STRING }
+            }
+          },
+          insights: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                description: { type: Type.STRING },
+                trend: { type: Type.STRING, enum: ["stable", "improving", "declining", "new"] }
+              }
+            }
+          },
+          guidance: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                step: { type: Type.STRING },
+                rationale: { type: Type.STRING }
+              }
+            }
+          },
+          concept_stability: {
+            type: Type.OBJECT,
+            properties: {
+                status: { type: Type.STRING, enum: ["emerging", "unstable_pressure", "stabilizing", "robust", "unknown"] },
+                evidence: { type: Type.STRING }
+            }
+          },
+          teacher_insight: { type: Type.STRING }
+        }
+    };
 
-      // Mapping response to internal type
-      const result: AnalysisResult = {
+    let rawData: any;
+
+    try {
+        // 1. Try Server
+        const response = await fetch(`${API_BASE}/reason`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error("Server Error");
+        rawData = await response.json();
+    } catch (e) {
+        console.warn("Falling back to SDK for Reasoning");
+        // 2. Fallback SDK
+        const modelName = mode === 'fast' ? 'gemini-3-flash-preview' : 'gemini-3-pro-preview';
+        const parts: any[] = [{ text: prompt }];
+        if (base64Image && mimeType) {
+            parts.unshift({ inlineData: { data: base64Image, mimeType: mimeType } });
+        }
+
+        const response = await ai.models.generateContent({
+            model: modelName,
+            contents: { parts },
+            config: {
+                systemInstruction: SYSTEM_INSTRUCTION_REASONING,
+                responseMimeType: "application/json",
+                responseSchema: reasonSchema
+            }
+        });
+        rawData = JSON.parse(response.text || "{}");
+    }
+
+    // Common Post-Processing
+    const result: AnalysisResult = {
         id: crypto.randomUUID(),
         timestamp: Date.now(),
         subject: context.subject,
         topic: context.topic,
-        score: data.score || { value: "-", label: "Pending", reasoning: "Analysis incomplete" },
-        feedback: Array.isArray(data.feedback) ? data.feedback : [],
-        insights: Array.isArray(data.insights) ? data.insights : [],
-        guidance: Array.isArray(data.guidance) ? data.guidance : [],
-        handwriting: data.handwriting,
-        conceptStability: data.concept_stability,
-        teacherInsight: data.teacher_insight,
+        score: rawData.score || { value: "-", label: "Pending", reasoning: "Analysis incomplete" },
+        feedback: Array.isArray(rawData.feedback) ? rawData.feedback : [],
+        insights: Array.isArray(rawData.insights) ? rawData.insights : [],
+        guidance: Array.isArray(rawData.guidance) ? rawData.guidance : [],
+        handwriting: rawData.handwriting,
+        conceptStability: rawData.concept_stability,
+        teacherInsight: rawData.teacher_insight,
         ownership: context.ownership,
         rawText: extractedText
-      };
+    };
 
-      this.injectAnalysisContext(result);
-
-      return result;
-
-    } catch (e) {
-      console.error("Reasoning failed", e);
-      throw new Error("Eduvane could not complete the diagnosis.");
-    }
+    this.injectAnalysisContext(result);
+    return result;
   }
 
-  // --- Capability 2: Learning Task Execution (Stateful via Remote Session) ---
+  // --- Capability 2: Learning Task Execution (Hybrid Chat) ---
 
-  async streamLearningTask(message: string, userRole?: UserRole): Promise<any> {
+  async streamLearningTask(message: string, userRole?: UserRole): Promise<AsyncGenerator<IGenerationChunk>> {
     const session = this.getOrCreateSession();
     const contextMsg = `[Active User Role: ${userRole || 'Ambiguous'}] ${message}`;
     return session.sendMessageStream({ message: contextMsg });
@@ -278,13 +449,10 @@ export class GeminiService {
       ${insights.map(i => `- ${i.title}: ${i.trend}`).join('\n')}
       
       Teacher Insight (If any): ${result.teacherInsight || "None"}
-
-      This information is available for future task generation. Use it to infer intent (misconception vs slip) and sequence diagnostics.
     `;
     
     try {
       const session = this.getOrCreateSession();
-      // We use the non-streaming send for context injection
       await session.sendMessage({ message: contextPayload }); 
     } catch (e) {
       console.error("Failed to inject context", e);
